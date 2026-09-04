@@ -293,6 +293,14 @@ LoRA that contains multiple subjects is easier to generate multiple characters. 
 - **Edit** / reference images *(ImageStitch)* are not supported; the Extension logs a warning and skips that generation
 - Attention runs through `SDPA` while a regional generation is active, which is somewhat slower than the flash backend
 
+#### Regional LoRA (Krea 2)
+
+On Krea 2, a `<lora:...>` tag placed on a **region** line applies only inside that region *(plus the line's own text)*; a tag on a **global** line stays global; the same LoRA on several lines covers all of them. Forge still merges every LoRA as usual — the Extension subtracts each LoRA's contribution from the tokens outside its region, so the other regions behave as if that LoRA were never loaded.
+
+- Toggle: **Settings** > **Forge Couple** > **[Krea 2] Regional LoRA** *(on by default)*
+- Plain LoRAs only; DoRA / LoCon / norm patches stay global with a warning in the console
+- The first use of a LoRA file reads it once per session
+
 <p align="center">
 <img src="example/krea.jpg" width=512><br>
 <b>Krea 2</b> Basic Mode, <b>First Line</b> Global Effect

@@ -9,16 +9,35 @@ krea.py itself is never edited.
 """
 
 import math
+import sys
+import types
+from dataclasses import dataclass, field
 
 import torch
 
 from backend import attention as _attention
+from backend import memory_management
 from backend.args import dynamic_args
 from backend.nn import krea as _krea
+from backend.patcher.lora import load_lora, model_lora_keys_unet
+from backend.state_dict import state_dict_prefix_replace
+from backend.utils import load_torch_file
 from lib_couple.logging import logger
 from modules.shared import opts
 
 from . import krea_bias as _bias
+from . import krea_lora as _lora
+
+
+@dataclass
+class _LoraSpec:
+    name: str
+    seg_indices: list[int]
+    layers: dict[str, _lora.LowRank] = field(default_factory=dict)  # module path under the DiT -> LowRank
+
+
+# per-file cache of low-rank layers (CPU) for the session: filename -> (layers, skipped)
+_LOWRANK_CACHE: dict[str, tuple[dict[str, _lora.LowRank], int]] = {}
 
 
 class _State:
@@ -39,8 +58,14 @@ class _State:
         self.block_counter: int = 0
         self.txt_split: list[int] | None = None
         self.txt_seg: int | None = None
+        self.tok_w: torch.Tensor | None = None  # (n_specs, L) per forward
+        # regional LoRAs
+        self.lora_specs: list[_LoraSpec] = []
+        self.module_entries: dict[str, list[tuple[int, _lora.LowRank]]] = {}
+        self.wrapped: list[torch.nn.Module] = []
         # caches / one-shot flags
         self.bias_cache: dict = {}
+        self.tok_w_cache: dict = {}
         self.warned_ref: bool = False
 
 
@@ -52,7 +77,7 @@ class AttentionCoupleKrea:
 
     @staticmethod
     @torch.inference_mode()
-    def patch_dit(model, base_mask, width: int, height: int, kwargs: dict):
+    def patch_dit(model, base_mask, width: int, height: int, kwargs: dict, loras=()):
         AttentionCoupleKrea.unpatch()
         try:
             num_conds = len(kwargs) // 2 + 1
@@ -77,6 +102,19 @@ class AttentionCoupleKrea:
             _krea.attention_function = _attention.attention_pytorch  # attention_flash asserts mask is None
             state.active = True
 
+            if loras:
+                specs = _build_lora_specs(list(loras), model.model)
+                if specs:
+                    _wrap_loras(dit, specs)
+                    # Move the matrices now, before Forge plans the model load. Placing them
+                    # lazily inside the forward let Forge over-fill VRAM and Windows paged.
+                    device = memory_management.get_torch_device()
+                    dtype = model.model.computation_dtype
+                    for spec in state.lora_specs:
+                        for lr in spec.layers.values():
+                            moved = lr.to(device, dtype)
+                            lr.up, lr.down = moved.up, moved.down
+
             # Tell Forge's memory planner about the two attention biases plus the float32
             # build intermediate; without this Forge fills VRAM to the brim and pages.
             grid = 8 * dit.patch
@@ -86,6 +124,7 @@ class AttentionCoupleKrea:
             logger.info(
                 f"Krea 2: {num_conds - 1} lines ({sum(state.is_global)} global), "
                 f"blend {state.blend} -> {int(round(state.blend * len(dit.blocks)))} gated blocks"
+                + (f", regional LoRAs: {len(state.lora_specs)}" if state.lora_specs else "")
             )
             return model
 
@@ -95,7 +134,12 @@ class AttentionCoupleKrea:
             return None
 
     @staticmethod
+    def active_loras() -> list[tuple[str, list[int]]]:
+        return [(spec.name, list(spec.seg_indices)) for spec in state.lora_specs]
+
+    @staticmethod
     def unpatch():
+        _unwrap_loras()
         if "dit_forward" in _originals:
             _krea.SingleStreamDiT.forward = _originals.pop("dit_forward")
         if "block_forward" in _originals:
@@ -134,6 +178,138 @@ def _cond_rows(transformer_options: dict, rows: int) -> torch.Tensor:
     return cond_mark.flatten()[:rows].cpu() < 0.5
 
 
+# ---------------------------------------------------------------- regional LoRAs
+
+
+def _lowrank_layers(filename: str, unet_model):
+    if filename not in _LOWRANK_CACHE:
+        sd = load_torch_file(filename, safe_load=True)
+        if any(k.startswith("lora_unet__") for k in sd):
+            sd = state_dict_prefix_replace(sd, {"lora_unet__": "lora_unet_"})
+        patches = load_lora(sd, model_lora_keys_unet(unet_model))
+        if isinstance(patches, tuple):  # Forge's load_lora returns (patch_dict, remaining_keys)
+            patches = patches[0]
+        layers: dict[str, _lora.LowRank] = {}
+        skipped = 0
+        for key, adapter in patches.items():
+            if not (key.startswith("diffusion_model.") and key.endswith(".weight")) or not hasattr(adapter, "weights"):
+                skipped += 1
+                continue
+            lr = _lora.extract_lowrank(adapter.weights, 1.0)
+            if lr is None:
+                skipped += 1
+                continue
+            layers[key[len("diffusion_model.") : -len(".weight")]] = lr
+        _LOWRANK_CACHE[filename] = (layers, skipped)
+    return _LOWRANK_CACHE[filename]
+
+
+def _build_lora_specs(line_loras: list[list[str]], unet_model) -> list[_LoraSpec]:
+    nets = getattr(sys.modules.get("networks"), "loaded_networks", [])
+    by_name = {}
+    for n in nets:
+        by_name[n.name] = n
+        if getattr(n, "mentioned_name", None):
+            by_name[n.mentioned_name] = n
+
+    per_name: dict[str, set[int]] = {}
+    for seg, names in enumerate(line_loras):
+        if seg >= len(state.is_global) or state.is_global[seg]:
+            continue  # global line: LoRA stays global
+        for name in names:
+            per_name.setdefault(name, set()).add(seg)
+
+    specs = []
+    for name, segs in per_name.items():
+        net = by_name.get(name)
+        if net is None:
+            logger.warning(f"Krea 2: LoRA '{name}' is not loaded; staying global")
+            continue
+        layers, skipped = _lowrank_layers(net.network_on_disk.filename, unet_model)
+        strength = float(net.unet_multiplier)
+        copies = {path: _lora.LowRank(lr.up, lr.down, lr.scale * strength) for path, lr in layers.items()}
+        if skipped:
+            logger.warning(f"Krea 2: LoRA '{name}': {skipped} unsupported layer(s) stay global")
+        if not copies:
+            logger.warning(f"Krea 2: LoRA '{name}': no supported layers; staying global")
+            continue
+        specs.append(_LoraSpec(name, sorted(segs), copies))
+    return specs
+
+
+def _wrap_loras(dit, specs: list[_LoraSpec]):
+    entries: dict[str, list[tuple[int, _lora.LowRank]]] = {}
+    for i, spec in enumerate(specs):
+        for path, lr in spec.layers.items():
+            entries.setdefault(path, []).append((i, lr))
+
+    missing = 0
+    for path in list(entries):
+        try:
+            m = dit.get_submodule(path)
+        except AttributeError:
+            missing += 1
+            del entries[path]
+            continue
+        m._fc_path = path
+        m._fc_mode = "txt" if path.startswith("txtfusion.") else "seq"
+        m.forward = types.MethodType(_lora_linear_forward, m)
+        state.wrapped.append(m)
+
+    state.module_entries = entries
+    state.lora_specs = specs
+    for spec in specs:
+        logger.info(f"Krea 2: LoRA '{spec.name}' -> line(s) {[i + 1 for i in spec.seg_indices]} ({len(spec.layers)} layers)")
+    if missing:
+        logger.warning(f"Krea 2: {missing} LoRA layer path(s) not found in the model; those stay global")
+
+
+def _unwrap_loras():
+    for m in state.wrapped:
+        m.__dict__.pop("forward", None)
+        for attr in ("_fc_path", "_fc_mode"):
+            if hasattr(m, attr):
+                delattr(m, attr)
+    state.wrapped = []
+    state.module_entries = {}
+    state.lora_specs = []
+
+
+def _lr_on(lr: _lora.LowRank, x: torch.Tensor) -> _lora.LowRank:
+    if lr.up.device != x.device or lr.up.dtype != x.dtype:
+        moved = lr.to(x.device, x.dtype)
+        lr.up, lr.down = moved.up, moved.down  # spec-local copies, safe to cast in place
+    return lr
+
+
+def _lora_linear_forward(self, x):
+    out = type(self).forward(self, x)
+    entries = state.module_entries.get(getattr(self, "_fc_path", None))
+    if not entries:
+        return out
+    if self._fc_mode == "seq":
+        tw = state.tok_w
+        if tw is None or x.shape[-2] != tw.shape[-1]:
+            return out
+        pairs = [(_lr_on(lr, x), tw[i]) for i, lr in entries]
+    else:
+        if state.txt_seg is None:
+            return out
+        pairs = [
+            (_lr_on(lr, x), 1.0 if state.txt_seg in state.lora_specs[i].seg_indices else 0.0) for i, lr in entries
+        ]
+    return _lora.subtract_outside(out, x, pairs)
+
+
+def _tok_weights_for(h: int, w: int, device: torch.device) -> torch.Tensor:
+    key = (h, w, str(device))
+    if key not in state.tok_w_cache:
+        masks = _bias.resize_masks(state.spatial.to(device), h, w)
+        rows = [_lora.token_weights(state.seg_lens, spec.seg_indices, state.is_global, masks) for spec in state.lora_specs]
+        state.tok_w_cache[key] = torch.stack(rows, dim=0)
+    return state.tok_w_cache[key]
+
+
 # ---------------------------------------------------------------- patched forwards
 
 
@@ -146,12 +322,15 @@ def _run_regional(self, x, timesteps, context, attention_mask, transformer_optio
     state.n_self = int(round(state.blend * len(self.blocks)))
     state.block_counter = 0
     state.txt_split = list(state.seg_lens)
+    if state.lora_specs:
+        state.tok_w = _tok_weights_for(h, w, x.device)
     try:
         return orig(self, x, timesteps, ctx, attention_mask, transformer_options, **kwargs)
     finally:
         state.bias = None
         state.bias_gated = None
         state.txt_split = None
+        state.tok_w = None
 
 
 def _dit_forward(self, x, timesteps, context, attention_mask=None, transformer_options={}, **kwargs):

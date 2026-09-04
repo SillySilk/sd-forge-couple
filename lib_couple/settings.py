@@ -59,5 +59,14 @@ def fc_settings():
         ),
     )
 
+    opts.add_option(
+        "fc_krea_regional_lora",
+        OptionInfo(
+            True,
+            "[Krea 2] Regional LoRA",
+            **args,
+        ).info("a <lora> tag on a region line applies only to that region; tags on a global line stay global"),
+    )
+
 
 on_ui_settings(fc_settings)

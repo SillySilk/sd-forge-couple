@@ -31,7 +31,7 @@ try:
 except ImportError:
     AttentionCoupleKrea = None
 
-from modules import scripts, shared
+from modules import extra_networks, scripts, shared
 
 VERSION = "7.1.0"
 
@@ -62,6 +62,8 @@ class ForgeCouple(scripts.Script):
 
         self.tile_idx: int
         self.tiles: list[str] = []
+
+        self.krea_loras: list[list[str]] = []
 
     def title(self):
         return "Forge Couple"
@@ -143,6 +145,21 @@ class ForgeCouple(scripts.Script):
                 prompt = prompt.replace(m.group(0), common_prompts[key])
 
         return prompt
+
+    def _krea_line_loras(self, p: "P", separator: str, common_parser: str, def_in_prompt: bool) -> list[list[str]]:
+        """LoRA names tagged on each line. Forge strips the tags before Couple sees the
+        prompt, so re-read the raw one and apply the same Common Prompts pass and separator."""
+        try:
+            raw: str = p.all_prompts[p.iteration * p.batch_size]
+        except Exception:
+            raw = p.prompt
+        if common_parser in ("{ }", "< >"):
+            raw = self.parse_common_prompt(raw, common_parser.split(" "), def_in_prompt)
+        result: list[list[str]] = []
+        for chunk in raw.split(separator):
+            _, data = extra_networks.parse_prompt(chunk)
+            result.append([params.items[0] for params in data.get("lora", []) if params.items])
+        return result
 
     def invalidate(self, p):
         self.valid = False
@@ -255,6 +272,14 @@ class ForgeCouple(scripts.Script):
         self.couples = couples
         self.valid = True
 
+        self.krea_loras = []
+        if _is_krea(p) and getattr(shared.opts, "fc_krea_regional_lora", True):
+            line_loras = self._krea_line_loras(p, separator, common_parser, def_in_prompt)
+            if len(line_loras) == len(couples):
+                self.krea_loras = line_loras
+            else:
+                logger.warning("Could not align LoRA tags with the lines; LoRAs stay global")
+
     def before_process_batch(self, p: "P", *args, **kwargs):
         if _is_anima(p):
             AttentionCoupleAnima.unpatch()
@@ -359,8 +384,12 @@ class ForgeCouple(scripts.Script):
             )
         elif _is_krea(p):
             patched_unet = AttentionCoupleKrea.patch_dit(
-                unet, base_mask, WIDTH, HEIGHT, fc_args
+                unet, base_mask, WIDTH, HEIGHT, fc_args, loras=self.krea_loras
             )
+            if active := AttentionCoupleKrea.active_loras():
+                p.extra_generation_params["forge_couple_krea_loras"] = ", ".join(
+                    f"{name}:{'+'.join(str(i + 1) for i in lines)}" for name, lines in active
+                )
         else:
             patched_unet = AttentionCouple.patch_unet(unet, base_mask, fc_args)
 
