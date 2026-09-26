@@ -64,6 +64,7 @@ class ForgeCouple(scripts.Script):
         self.tiles: list[str] = []
 
         self.krea_loras: list[list[str]] = []
+        self.krea_blend: float = 0.25
 
     def title(self):
         return "Forge Couple"
@@ -272,6 +273,8 @@ class ForgeCouple(scripts.Script):
         self.couples = couples
         self.valid = True
 
+        self.krea_blend = float(args[0]) if args else 0.25
+
         self.krea_loras = []
         if _is_krea(p) and getattr(shared.opts, "fc_krea_regional_lora", True):
             line_loras = self._krea_line_loras(p, separator, common_parser, def_in_prompt)
@@ -384,7 +387,8 @@ class ForgeCouple(scripts.Script):
             )
         elif _is_krea(p):
             patched_unet = AttentionCoupleKrea.patch_dit(
-                unet, base_mask, WIDTH, HEIGHT, fc_args, loras=self.krea_loras
+                unet, base_mask, WIDTH, HEIGHT, fc_args, loras=self.krea_loras,
+                blend=self.krea_blend,
             )
             if active := AttentionCoupleKrea.active_loras():
                 p.extra_generation_params["forge_couple_krea_loras"] = ", ".join(

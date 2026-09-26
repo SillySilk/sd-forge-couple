@@ -184,6 +184,17 @@ def couple_ui(script, is_img2img: bool, title: str):
                 common_debug = gr.Checkbox(False, label="Debug", scale=1)
                 common_debug.do_not_save_to_config = True
 
+        with gr.Row():
+            krea_blend = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                step=0.05,
+                value=0.25,
+                label="[Krea 2] Region Blend",
+                info="image-to-image gating depth; above 0.4 causes seams/duplicates",
+                scale=1,
+            )
+
         def on_mode_change(choice: str):
             return [
                 gr.update(visible=(choice in ("Basic", "Mask"))),
@@ -211,6 +222,7 @@ def couple_ui(script, is_img2img: bool, title: str):
             (background_weight, "forge_couple_background_weight"),
             (mapping_paste_field, "forge_couple_mapping"),
             (common_parser, "forge_couple_common_parser"),
+            (krea_blend, "forge_couple_krea_blend"),
         ]
 
         for comp, name in script.infotext_fields:
@@ -237,5 +249,6 @@ def couple_ui(script, is_img2img: bool, title: str):
         common_parser,
         common_debug,
         def_in_prompt,
+        krea_blend,
         *tile_args,
     ], couple_mask.get_masks

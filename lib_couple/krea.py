@@ -77,7 +77,7 @@ class AttentionCoupleKrea:
 
     @staticmethod
     @torch.inference_mode()
-    def patch_dit(model, base_mask, width: int, height: int, kwargs: dict, loras=()):
+    def patch_dit(model, base_mask, width: int, height: int, kwargs: dict, loras=(), blend=None):
         AttentionCoupleKrea.unpatch()
         try:
             num_conds = len(kwargs) // 2 + 1
@@ -89,7 +89,7 @@ class AttentionCoupleKrea:
             state.context = torch.cat([s.detach() for s in segments], dim=0).unsqueeze(0)
             state.spatial = spatial.detach().cpu()
             state.is_global = _bias.find_globals(state.spatial)
-            state.blend = float(getattr(opts, "fc_krea_blend", 0.25))
+            state.blend = float(blend) if blend is not None else float(getattr(opts, "fc_krea_blend", 0.25))
 
             dit = model.model.diffusion_model
             _originals["dit_forward"] = _krea.SingleStreamDiT.forward
